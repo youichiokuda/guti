@@ -1,3 +1,4 @@
+# backend/main.py
 import os
 import secrets
 from pathlib import Path
@@ -18,14 +19,17 @@ from .llm import answer_from_records
 
 # --- DB setup ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
 # --- FastAPI app ---
 app = FastAPI()
 
-# static マウント
+# static マウント（/static/index.html など）
 app.mount(
     "/static",
     StaticFiles(directory=str(Path(__file__).resolve().parent.parent / "static")),
@@ -36,7 +40,7 @@ app.mount(
 origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[o.strip() for o in origins if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,7 +91,7 @@ class ChatRequest(BaseModel):
 
 # --- Routes ---
 
-# Root → GUI
+# Root → GUI（/static/index.html が無い場合は JSON を返す）
 @app.get("/", response_class=FileResponse)
 def index():
     index_path = Path(__file__).resolve().parent.parent / "static" / "index.html"
@@ -116,7 +120,9 @@ def create_tenant(body: TenantCreate, db: Session = Depends(get_db)):
 # Config 作成
 @app.post("/api/configs")
 def create_config(
-    body: ConfigCreate, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)
+    body: ConfigCreate,
+    tenant: Tenant = Depends(get_tenant),
+    db: Session = Depends(get_db),
 ):
     encrypted_token = encrypt_api_token(body.api_token_plain)
     config = AppConfig(
@@ -182,10 +188,12 @@ def update_config(
     }
 
 
-# Kintone フィールド取得
+# Kintone フィールド取得（form API → records フォールバック）
 @app.get("/api/kintone/fields")
 async def get_kintone_fields(
-    config_id: int, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)
+    config_id: int,
+    tenant: Tenant = Depends(get_tenant),
+    db: Session = Depends(get_db),
 ):
     config = (
         db.query(AppConfig)
@@ -194,8 +202,9 @@ async def get_kintone_fields(
     )
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
+
     api_token = decrypt_api_token(config.api_token)
-    client = KintoneClient(config.domain, config.app_id, api_token)  # 修正済み
+    client = KintoneClient(config.domain, config.app_id, api_token)
     fields = await client.fetch_fields()
     return fields
 
@@ -203,7 +212,9 @@ async def get_kintone_fields(
 # Chat
 @app.post("/api/chat")
 async def chat(
-    req: ChatRequest, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)
+    req: ChatRequest,
+    tenant: Tenant = Depends(get_tenant),
+    db: Session = Depends(get_db),
 ):
     config = (
         db.query(AppConfig)
@@ -212,13 +223,23 @@ async def chat(
     )
     if not config:
         raise HTTPException(status_code=404, detail="Config not found")
+
     api_token = decrypt_api_token(config.api_token)
-    client = KintoneClient(config.domain, config.app_id, api_token)  # 修正済み
+    client = KintoneClient(config.domain, config.app_id, api_token)
+
     fields = config.target_fields.split(",") if config.target_fields else []
     if not fields:
         raise HTTPException(status_code=400, detail="No target_fields set")
-    safe_q = req.query.replace('"', '\\"')
-    kquery = f'{fields[0]} like "{safe_q}"'
+
+    # いちばん先頭のフィールドで like 検索
+    kquery = f'{fields[0]} like "{req.query}"'
     data = await client.fetch_records(query=kquery, limit=50)
+    # kintone の 4xx は data["error"] で返る実装
+    if isinstance(data, dict) and data.get("error"):
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "kintone query failed", "kintone": data},
+        )
+
     answer = answer_from_records(req.query, data.get("records", []))
     return {"query": req.query, "answer": answer, "records": data.get("records", [])}
