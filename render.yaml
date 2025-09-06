@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: kintone-chatbot-saas
+    env: docker
+    plan: free
+    region: oregon
+    autoDeploy: true
+    envVars:
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: "*"
