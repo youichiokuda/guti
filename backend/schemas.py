@@ -1,12 +1,9 @@
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 class TenantCreate(BaseModel):
     name: str
-
 class TenantOut(BaseModel):
-    id: int
-    name: str
     api_key: str
 
 class ConfigCreate(BaseModel):
@@ -14,7 +11,13 @@ class ConfigCreate(BaseModel):
     domain: str
     app_id: int
     api_token_plain: str
-    target_fields: List[str] = Field(default_factory=list)
+    target_fields: List[str] = []
+
+class ConfigUpdate(BaseModel):
+    name: Optional[str] = None
+    domain: Optional[str] = None
+    app_id: Optional[int] = None
+    target_fields: Optional[List[str]] = None
 
 class ConfigOut(BaseModel):
     id: int
@@ -30,3 +33,5 @@ class ChatIn(BaseModel):
 class ChatOut(BaseModel):
     hits: int
     sample: list
+    query: str
+    kintone_query: str

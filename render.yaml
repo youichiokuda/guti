@@ -3,10 +3,12 @@ services:
     name: kintone-chatbot-saas
     env: docker
     plan: free
-    region: oregon
+    healthCheckPath: /
     autoDeploy: true
     envVars:
       - key: ENCRYPTION_KEY
-        generateValue: true
+        sync: false
       - key: ALLOWED_ORIGINS
         value: "*"
+      - key: DATABASE_URL
+        value: "sqlite:////data/data.db"
