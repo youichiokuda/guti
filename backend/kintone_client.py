@@ -1,5 +1,4 @@
 # backend/kintone_client.py
-
 import httpx
 
 
@@ -8,24 +7,20 @@ class KintoneClient:
         self.domain = domain
         self.api_token = api_token
         self.app_id = app_id
-
-        # ヘッダーは文字列のみ
         self.headers = {
             "X-Cybozu-API-Token": str(self.api_token),
             "Content-Type": "application/json",
         }
 
     async def fetch_records(self, query: str = "", limit: int = 50) -> dict:
-        """
-        レコードを取得
-        """
         url = f"https://{self.domain}/k/v1/records.json"
         params = {
-            "app": str(self.app_id),        # 数値は str() に
-            "query": query,                 # 例: 'name like "foo"'
+            "app": str(self.app_id),
             "totalCount": "true",
             "limit": str(limit),
         }
+        if query:
+            params["query"] = query
         async with httpx.AsyncClient(timeout=60.0) as c:
             r = await c.get(url, headers=self.headers, params=params)
             r.raise_for_status()
@@ -33,18 +28,20 @@ class KintoneClient:
 
     async def fetch_fields(self) -> dict:
         """
-        アプリのフィールド一覧を取得
+        フィールド一覧を records.json（APIトークン対応）から推定して返す。
+        アプリ設定API（app/form/fields.json）はAPIトークン非対応のため使用しない。
         """
-        url = f"https://{self.domain}/k/v1/app/form/fields.json"
-        params = {"app": str(self.app_id)}   # app_id も必ず文字列
-        async with httpx.AsyncClient(timeout=30.0) as c:
-            r = await c.get(url, headers=self.headers, params=params)
-            r.raise_for_status()
-            data = r.json()
-            properties = data.get("properties") or {}
-            # 整形して返す
-            fields = [
-                {"code": code, **info}
-                for code, info in properties.items()
-            ]
-            return {"fields": fields}
+        # 1件だけ取得してキーを読む
+        data = await self.fetch_records(limit=1)
+        records = data.get("records") or []
+        if not records:
+            # レコードが無い場合は最低限 app_id だけ返す
+            return {"fields": []}
+
+        sample = records[0]  # dict
+        fields = []
+        for code, val in sample.items():
+            # kintoneのレコードJSONは {"フィールドコード": {"type": "...", "value": ...}} の形
+            ftype = (val or {}).get("type")
+            fields.append({"code": code, "type": ftype})
+        return {"fields": fields}
