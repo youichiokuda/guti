@@ -1,90 +1,184 @@
-import os, secrets
+import os
+import secrets
+from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, Depends, Header, HTTPException
+
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from .db import Base, engine, SessionLocal
-from .models import Tenant, AppConfig
-from .schemas import TenantCreate, TenantOut, ConfigCreate, ConfigOut, ConfigUpdate, ChatIn, ChatOut
-from .security import encrypt, decrypt
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from .models import Base, Tenant, AppConfig
+from .security import encrypt_api_token, decrypt_api_token
 from .kintone_client import KintoneClient
 from .llm import answer_from_records
 
+# --- DB setup ---
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
+# --- FastAPI app ---
 app = FastAPI()
-origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
-app.add_middleware(CORSMiddleware, allow_origins=origins if origins != ["*"] else ["*"],
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# static マウント
+app.mount(
+    "/static",
+    StaticFiles(directory=str(Path(__file__).resolve().parent.parent / "static")),
+    name="static",
+)
+
+# CORS
+origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Dependencies ---
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try:
+        yield db
+    finally:
+        db.close()
 
-async def get_tenant(x_tenant_key: Optional[str] = Header(None), db: Session = Depends(get_db)):
-    if not x_tenant_key:
-        raise HTTPException(status_code=403, detail="X-Tenant-Key header required")
-    t = db.query(Tenant).filter(Tenant.api_key == x_tenant_key).first()
-    if not t: raise HTTPException(status_code=403, detail="Invalid X-Tenant-Key")
-    return t
+def get_tenant(api_key: Optional[str] = Header(None, alias="X-Tenant-Key"), db: Session = Depends(get_db)) -> Tenant:
+    if not api_key:
+        raise HTTPException(status_code=403, detail="X-Tenant-Key header missing")
+    tenant = db.query(Tenant).filter(Tenant.api_key == api_key).first()
+    if not tenant:
+        raise HTTPException(status_code=403, detail="Invalid tenant key")
+    return tenant
 
-@app.get("/")
-def root(): return {"ok": True, "service": "kintone-chatbot-saas"}
+# --- Schemas ---
+class TenantCreate(BaseModel):
+    name: str
 
-@app.post("/api/tenants", response_model=TenantOut)
-def create_tenant(payload: TenantCreate, db: Session = Depends(get_db)):
-    api_key = secrets.token_urlsafe(24)
-    t = Tenant(name=payload.name, api_key=api_key); db.add(t); db.commit(); db.refresh(t)
-    return TenantOut(api_key=t.api_key)
+class ConfigCreate(BaseModel):
+    name: str
+    domain: str
+    app_id: int
+    api_token_plain: str
+    target_fields: List[str]
 
-@app.get("/api/configs", response_model=List[ConfigOut])
+class ConfigUpdate(BaseModel):
+    target_fields: List[str]
+
+class ChatRequest(BaseModel):
+    query: str
+    config_id: int
+
+# --- Routes ---
+
+# Root → GUI
+@app.get("/", response_class=FileResponse)
+def index():
+    index_path = Path(__file__).resolve().parent.parent / "static" / "index.html"
+    if not index_path.exists():
+        return JSONResponse({"ok": True, "service": "kintone-chatbot-saas"})
+    return FileResponse(str(index_path))
+
+# Health check
+@app.get("/health", response_class=JSONResponse)
+def health():
+    return {"ok": True, "service": "kintone-chatbot-saas"}
+
+# Tenant 作成
+@app.post("/api/tenants")
+def create_tenant(body: TenantCreate, db: Session = Depends(get_db)):
+    api_key = secrets.token_hex(16)
+    tenant = Tenant(name=body.name, api_key=api_key)
+    db.add(tenant)
+    db.commit()
+    db.refresh(tenant)
+    return {"id": tenant.id, "name": tenant.name, "api_key": tenant.api_key}
+
+# Config 作成
+@app.post("/api/configs")
+def create_config(body: ConfigCreate, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
+    encrypted_token = encrypt_api_token(body.api_token_plain)
+    config = AppConfig(
+        tenant_id=tenant.id,
+        name=body.name,
+        domain=body.domain,
+        app_id=body.app_id,
+        api_token=encrypted_token,
+        target_fields=",".join(body.target_fields),
+    )
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+    return {
+        "id": config.id,
+        "name": config.name,
+        "domain": config.domain,
+        "app_id": config.app_id,
+        "target_fields": config.target_fields.split(",") if config.target_fields else [],
+    }
+
+# Config 一覧
+@app.get("/api/configs")
 def list_configs(tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
-    rows = db.query(AppConfig).filter(AppConfig.tenant_id == tenant.id).all()
-    return [ConfigOut(id=r.id, name=r.name, domain=r.domain, app_id=r.app_id, target_fields=r.target_fields or []) for r in rows]
+    configs = db.query(AppConfig).filter(AppConfig.tenant_id == tenant.id).all()
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "domain": c.domain,
+            "app_id": c.app_id,
+            "target_fields": c.target_fields.split(",") if c.target_fields else [],
+        }
+        for c in configs
+    ]
 
-@app.post("/api/configs", response_model=ConfigOut)
-def create_config(payload: ConfigCreate, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
-    enc = encrypt(payload.api_token_plain)
-    cfg = AppConfig(tenant_id=tenant.id, name=payload.name, domain=payload.domain, app_id=payload.app_id,
-                    api_token_enc=enc, target_fields=payload.target_fields or [])
-    db.add(cfg); db.commit(); db.refresh(cfg)
-    return ConfigOut(id=cfg.id, name=cfg.name, domain=cfg.domain, app_id=cfg.app_id, target_fields=cfg.target_fields or [])
+# Config 更新（target_fields）
+@app.put("/api/configs/{config_id}")
+def update_config(config_id: int, body: ConfigUpdate, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
+    config = db.query(AppConfig).filter(AppConfig.id == config_id, AppConfig.tenant_id == tenant.id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="Config not found")
+    config.target_fields = ",".join(body.target_fields)
+    db.commit()
+    db.refresh(config)
+    return {
+        "id": config.id,
+        "name": config.name,
+        "domain": config.domain,
+        "app_id": config.app_id,
+        "target_fields": config.target_fields.split(",") if config.target_fields else [],
+    }
 
-@app.put("/api/configs/{config_id}", response_model=ConfigOut)
-def update_config(config_id: int, payload: ConfigUpdate, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
-    cfg = db.query(AppConfig).filter(AppConfig.id == config_id, AppConfig.tenant_id == tenant.id).first()
-    if not cfg: raise HTTPException(status_code=404, detail="Config not found")
-    if payload.name is not None: cfg.name = payload.name
-    if payload.domain is not None: cfg.domain = payload.domain
-    if payload.app_id is not None: cfg.app_id = payload.app_id
-    if payload.target_fields is not None: cfg.target_fields = payload.target_fields
-    db.add(cfg); db.commit(); db.refresh(cfg)
-    return ConfigOut(id=cfg.id, name=cfg.name, domain=cfg.domain, app_id=cfg.app_id, target_fields=cfg.target_fields or [])
-
+# Kintone フィールド取得
 @app.get("/api/kintone/fields")
-async def kintone_fields(config_id: int, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
-    cfg = db.query(AppConfig).filter(AppConfig.id == config_id, AppConfig.tenant_id == tenant.id).first()
-    if not cfg: raise HTTPException(status_code=404, detail="Config not found")
-    token = decrypt(cfg.api_token_enc)
-    client = KintoneClient(cfg.domain, cfg.app_id, token)
-    data = await client.fetch_fields()
-    props = data.get("properties") or {}
-    out = [{"code": c, "type": meta.get("type"), "label": meta.get("label")} for c, meta in (props.items() if isinstance(props, dict) else [])]
-    return {"fields": out}
+async def get_kintone_fields(config_id: int, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
+    config = db.query(AppConfig).filter(AppConfig.id == config_id, AppConfig.tenant_id == tenant.id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="Config not found")
+    api_token = decrypt_api_token(config.api_token)
+    client = KintoneClient(config.domain, api_token, config.app_id)
+    fields = await client.fetch_fields()
+    return fields
 
-@app.post("/api/chat", response_model=ChatOut)
-async def chat(payload: ChatIn, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
-    cfg = db.query(AppConfig).filter(AppConfig.id == payload.config_id, AppConfig.tenant_id == tenant.id).first()
-    if not cfg: raise HTTPException(status_code=404, detail="Config not found")
-    if not cfg.target_fields: raise HTTPException(status_code=400, detail="target_fields is empty")
-    like_field = cfg.target_fields[0]
-    q = payload.query.replace('"', '\\"')
-    kquery = f'{like_field} like "{q}"'
-    token = decrypt(cfg.api_token_enc)
-    client = KintoneClient(cfg.domain, cfg.app_id, token)
+# Chat
+@app.post("/api/chat")
+async def chat(req: ChatRequest, tenant: Tenant = Depends(get_tenant), db: Session = Depends(get_db)):
+    config = db.query(AppConfig).filter(AppConfig.id == req.config_id, AppConfig.tenant_id == tenant.id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="Config not found")
+    api_token = decrypt_api_token(config.api_token)
+    client = KintoneClient(config.domain, api_token, config.app_id)
+    fields = config.target_fields.split(",") if config.target_fields else []
+    if not fields:
+        raise HTTPException(status_code=400, detail="No target_fields set")
+    kquery = f'{fields[0]} like "{req.query}"'
     data = await client.fetch_records(query=kquery, limit=50)
-    records = data.get("records", [])
-    sample = answer_from_records(records, cfg.target_fields or [like_field])
-    total = int(data.get("totalCount") or len(records) or 0)
-    return ChatOut(hits=total, sample=sample, query=payload.query, kintone_query=kquery)
+    answer = answer_from_records(req.query, data.get("records", []))
+    return {"query": req.query, "answer": answer, "records": data.get("records", [])}

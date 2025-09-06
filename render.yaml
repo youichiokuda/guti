@@ -2,6 +2,7 @@ services:
   - type: web
     name: kintone-chatbot-saas
     env: docker
+    healthCheckPath: /health
     plan: free
     healthCheckPath: /
     autoDeploy: true
